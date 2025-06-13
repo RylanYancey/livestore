@@ -6,5 +6,5 @@ edition = "2024"
 [dependencies]
 boomphf = "0.6.0"
 dashmap = "6.1.0"
-tokio = { version = "1.45.1", features = ["rt", "sync", "macros", "time", "signal"] }
+tokio = { version = "1.45.1", features = ["rt-multi-thread", "sync", "macros", "time", "signal"] }
 uuid = { version = "1.17.0", features = ["v4"] }

@@ -1,12 +1,191 @@
 
-#![doc = include_str!("../README.md")]
+//! A statically typed ultra lightweight alternative to Redis.
+//! 
+//! A LiveStore is a concurrent hashmap for use in real-time websocket servers. 
+//! Keys are always UUID-V4, and the values can be anything that implements `LiveValue`. 
+//! 
+//! All data is kept in-memory in its native rust layout. This eliminates the overhead of 
+//! deserializing/serializing data on every access, but any data in the store will
+//! be dropped when the store is dropped. We do not yet support any in-disk caching or saving/loading 
+//! of values.
+//! 
+//! ## Features
+//! - Insert/Remove/Fetch
+//! - Powered by Google ABSL Hash Table (DashMap)
+//! - Per-Entry mutation locking (prevents race conditions)
+//! - Subscribe/Listen to value updates asyncronously (via Tokio broadcast)
+//! - Auto-expire on timeout
+//! 
+//! ## Todos
+//! - Rollback/Version tracking
+//! - Serializing and Deserializing Stores, save/load
+//! - Lower per-entry memory usage
+//! 
+//! ## Should you use LiveStore?
+//! Probably not. This is maintained by a college dropout in his 20s, not a corporation or conglomerate with millions 
+//! of dollars. You will probably get better performance and features by just using Redis. But, if you hate dynamic
+//! typing as much as I do, you might find some value in it. 
+//! 
+//! ## Concepts
+//! **Map-level Locks (Sync)**\
+//! Internally each store is a `DashMap`, which is a HashMap broken up into "shards", or parts. Each shard has its own
+//! RwLock that needs to be acquired when reading or writing to its entries. To minimize the probability of contention,
+//! LiveStore tries to hold on to this lock for as short a period as possible. Thats' why none of the functions return a
+//! reference to entries, its always a clone. 
+//! 
+//! **Entry-level Locks (Async)**\
+//! A common operation is to read, compute changes, then assign a new value. But if another process mutates the value
+//! while another is computing changes, a race conditions occurs. This can lead to invalid states and unexpected crashes.
+//! To solve this, we could hold onto the map lock for the duration we are computing changes, but that would make the probability
+//! of contention too high, especially if the lock is held through an await. So instead there is a per-entry Mutex that
+//! can be acquired to prevent the state from being invalidated for the duration it is held. When a function with `.acquire`
+//! is called, an [`EntryGuard`] is returned, preventing any mutations or acquisitions until it is dropped. 
+//! 
+//! **Live Value**\
+//! A type that implements `LiveValue` and exists in a `LiveStore`.
+//! 
+//! **Mutation**\
+//! An event that can be dispatched to mutate a value and inform any subscribed tasks of the change.
+//! 
+//! **Message**\
+//! An event that can be dispatched just like a mutation and is sent to subscribed tasks, but does not alter value state.
+//! 
+//! ## Usage
+//! The first step is to implement `LiveValue` for your type. The associated types (Message, Mutation, MutError) are optional
+//! and can be set to `()` if you don't use them. 
+//! 
+//! Then, create a `LiveStore` with the builder via `LiveStore::new()` or use the provided defaults with `LiveStore::default()`. 
+//! 
+//! If you want a type-erased container, this crate also provides the `Storages` type, a convenience for erasing the
+//! value type and accessing with `Any::downcast()`.
+//! ```
+//! use std::time::Duration;
+//! use livestore::{LiveStore, LiveValue, Entry, Update, StoreOptions, ExpireMode, Uuid};
+//! 
+//! /// **Your Value Type**
+//! #[derive(Clone)]
+//! struct Foo {
+//!     bar: u32,
+//!     baz: u64
+//! }
+//! 
+//! #[derive(Clone)]
+//! enum FooMessage {
+//!     PrintBar
+//! }
+//! 
+//! #[derive(Clone)]
+//! enum FooMutation {
+//!     SetBar(u32),
+//!     SetBaz(u64)   
+//! }
+//! 
+//! #[derive(Clone)]
+//! enum FooError {
+//!     BarWas42
+//! }
+//! 
+//! // **Implement LiveValue for your Type**
+//! impl LiveValue for Foo {
+//!     type Message = FooMessage;
+//!     type Mutation = FooMutation;
+//!     type MutError = FooError;
+//! 
+//!     fn mutate(entry: &Entry<Self>, mutation: &Self::Mutation) -> Result<Self, Self::MutError> {
+//!         match mutation {
+//!             FooMutation::SetBar(bar) => {
+//!                 if *bar == 42 {
+//!                     Err(FooError::BarWas42)
+//!                 } else {
+//!                     Ok(Foo { 
+//!                         bar: *bar, 
+//!                         baz: entry.baz 
+//!                     })
+//!                 }
+//!             },
+//!             FooMutation::SetBaz(baz) => {
+//!                 Ok(Foo { 
+//!                     bar: entry.bar, 
+//!                     baz: *baz
+//!                 })
+//!             }
+//!         }
+//!     }
+//! }
+//! 
+//! #[tokio::main]
+//! async fn main() {
+//!     let store = LiveStore::<Foo>::new()
+//!         // Configure the store to auto-remove entries
+//!         // that haven't been mutated in 10 minutes, checked every 15 minutes.
+//!         .with_options(
+//!             StoreOptions {
+//!                 expire_check_freq: Some(Duration::from_secs(900)),
+//!                 expire_mode: ExpireMode::Timeout(Duration::from_secs(600)),
+//!                 ..Default::default()
+//!             }
+//!         )
+//!         // **Set an expiration callback**
+//!         .on_expire(move |expired: Vec<(Uuid, Entry<Foo>)>| {
+//!             async move {
+//!                 for (_, item) in expired {
+//!                     println!("Baz '{}' expired.", item.baz);
+//!                 }
+//!             }
+//!         })
+//!         .done();
+//!     
+//!     // Initialize values
+//!     let k1 = store.init(Foo { bar: 0, baz: 1 });
+//!     let k2 = store.init(Foo { bar: 1, baz: 0 });
+//!     
+//!     // Begin watching for changes
+//!     let mut sub = store.watch(&k1).unwrap();
+//!     tokio::spawn(async move {
+//!         while let Some(update) = sub.next().await {
+//!             match update {
+//!                 Update::Mutate { mutn, .. } => {
+//!                     match mutn {
+//!                         FooMutation::SetBar(bar) => println!("Set bar to '{bar}'."),
+//!                         FooMutation::SetBaz(baz) => println!("Set baz to '{baz}'."),
+//!                     }
+//!                 },
+//!                 Update::Message { msg, val } => {
+//!                     match msg {
+//!                         FooMessage::PrintBar => println!("Bar: {}", val.bar),
+//!                     }
+//!                 },
+//!                 _ => {}
+//!             }
+//!         }
+//!     });
+//! 
+//!     // Dispatch mutations and broadcast messages.
+//!     store.mutate(&k1, FooMutation::SetBar(6)).await;
+//!     store.mutate(&k1, FooMutation::SetBaz(9)).await;
+//!     store.broadcast(&k1, FooMessage::PrintBar);
+//! 
+//!     // Acquire mutation locks.
+//!     let mut entry2 = store.acquire(&k2).await.unwrap();
+//!     entry2.mutate(FooMutation::SetBar(7));
+//!     entry2.mutate(FooMutation::SetBaz(10));
+//!     entry2.broadcast(FooMessage::PrintBar);
+//! 
+//!     // Remove entries from the store.
+//!     entry2.delete();
+//!     store.remove(&k1).await.unwrap();
+//! }
+//! ```
 
 use std::{any::{type_name, Any, TypeId}, ops::Deref, pin::Pin, sync::Arc, time::{Duration, Instant}};
 
 use dashmap::{mapref::one::{Ref, RefMut}, DashMap};
 use tokio::sync::{broadcast::{error::RecvError, Receiver, Sender}, Mutex, OwnedMutexGuard};
-use uuid::Uuid;
 
+/// Uuid is re-exported for continuity.
+pub use uuid::Uuid;
+
+/// A Convenience for passing around type-erased LiveStores. 
 pub struct Storages {
     typeids: boomphf::Mphf<TypeId>,
     stores: Vec<Arc<dyn StoreType>>,
@@ -50,6 +229,7 @@ pub trait LiveValue: Clone + Sized + Send + Sync + Any {
 pub struct LiveStore<V: LiveValue> {
     map: DashMap<Uuid, RawEntry<V>>,
     options: StoreOptions,
+    on_expire: Option<AsyncCallback<Vec<(Uuid, Entry<V>)>>>,
 }
 
 #[derive(Copy, Clone)]
@@ -74,6 +254,11 @@ pub struct StoreOptions {
 
     /// The conditions of expiration.
     pub expire_mode: ExpireMode,
+}
+
+pub struct LiveStoreBuilder<V: LiveValue> {
+    options: StoreOptions,
+    on_expire: Option<AsyncCallback<Vec<(Uuid, Entry<V>)>>>,
 }
 
 #[derive(Copy, Clone)]
@@ -162,19 +347,14 @@ pub enum Update<V: LiveValue> {
 /// A wrapper over a `tokio::sync::broadcast::Receiver` for
 /// listening to mutations and messages for a LiveValue. 
 /// 
-/// This function will spawn a tokio task when `on_update` is called
-/// that will poll for updates. If you'd rather handle the receiver
-/// yourself, you can do so with the public `rx` field.
+/// Use `.next().await` to start listening for updates.
 pub struct Watch<V: LiveValue> {
     pub rx: Receiver<Update<V>>,
 }
 
-/// Used to control the behavior of [`Watch`] subscriptions
-/// from within the polling loop.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum Control {
-    Continue,
-    Break
+    Break, Continue
 }
 
 impl Storages {
@@ -185,8 +365,6 @@ impl Storages {
     }
 
     /// Get a reference to the ValueStore for a specific type.
-    /// 
-    /// This function will panic if [`LiveStoreBuilder::add_store::<V>`] has not been called.
     pub fn as_store<V: LiveValue>(&self) -> Arc<LiveStore<V>> {
         let id = TypeId::of::<V>();
         let idx = self.typeids.hash(&id) as usize;
@@ -219,60 +397,10 @@ impl StoragesBuilder {
 
 impl<V: LiveValue> LiveStore<V> {
     /// Initialize the store with the provided options.
-    pub fn new(options: StoreOptions) -> Arc<Self> {
-        Arc::new(
-            Self {
-                map: options.shard_amt.map(|amt| DashMap::with_shard_amount(amt)).unwrap_or_default(),
-                options,
-            }
-        )
-    }
-
-    /// Set the expiration callback
-    pub fn on_expire<F, Fut>(self: &Arc<Self>, cb: F) 
-    where
-        F: Fn(Vec<(Uuid, Entry<V>)>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output=()> + Send + Sync + 'static,
-    {
-        let store = self.clone();
-        let mode = self.options.expire_mode;
-    
-        if let Some(freq) = self.options.expire_check_freq {
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(freq);
-                loop {
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => return,
-                        _ = interval.tick() => {
-                            let mut expired = Vec::new();
-
-                            match mode {
-                                ExpireMode::Timeout(dur) => {
-                                    let min = Instant::now() - dur;
-            
-                                    store.map.retain(|uuid, raw| {
-                                        if raw.last_change < min {
-                                            let _ = raw.broadcast.send(
-                                                Update::Remove {
-                                                    msg: None,
-                                                    val: raw.value.clone(),
-                                                    key: *uuid,
-                                                }
-                                            );
-                                            expired.push((*uuid, Entry::from_raw(&raw)));
-                                            false
-                                        } else {
-                                            true
-                                        }
-                                    });
-                                }
-                            }
-
-                            cb(expired).await;
-                        },
-                    }
-                }
-            });
+    pub fn new() -> LiveStoreBuilder<V> {
+        LiveStoreBuilder {
+            options: StoreOptions::default(),
+            on_expire: None,
         }
     }
 
@@ -552,7 +680,48 @@ impl<V: LiveValue> LiveStore<V> {
             })
         })
     }
+
+    /// Dispatch a message to subscribed tasks of the entry at the key.
+    /// 
+    /// If the key does not exist, the message is returned. 
+    pub fn broadcast(&self, key: &Uuid, msg: V::Message) -> Option<V::Message> {
+        if let Some(raw) = self.map.get(key) {
+            let _ = raw.broadcast.send(Update::Message { msg, val: Entry::from_raw(&raw) });
+            None
+        } else {
+            Some(msg)
+        }
+    }
+
+    pub fn default() -> Arc<Self> {
+        Arc::new(
+            Self {
+                map: DashMap::new(),
+                options: StoreOptions::default(),
+                on_expire: None,
+            }
+        )
+    }
+    /// Remove any entries where the last change is before the minimum allowed time.
+    fn expire_by_timeout(&self, min: Instant) {
+        self.map.retain(|_, raw| raw.last_change < min && raw.lock.try_lock().is_ok())
+    }
+
+    /// Collect expired entries where the last change is before the minimum allowed time.
+    fn collect_expired_by_timeout(&self, min: Instant) -> Vec<(Uuid, Entry<V>)> {
+        let mut expired = Vec::new();
+        self.map.retain(|uuid, raw| {
+            if raw.last_change < min && raw.lock.try_lock().is_ok() {
+                expired.push((*uuid, Entry::from_raw(&raw)));
+                false   
+            } else {
+                true
+            }
+        });
+        expired
+    }
 }
+
 
 impl Default for StoreOptions {
     fn default() -> Self {
@@ -562,6 +731,90 @@ impl Default for StoreOptions {
             expire_check_freq: None,
             expire_mode: ExpireMode::Timeout(Duration::from_secs(60*60))
         }
+    }
+}
+
+impl<V: LiveValue> LiveStoreBuilder<V> {
+    pub fn with_options(mut self, options: StoreOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Set the function called whenever the expire callback is ran.
+    /// 
+    /// If you want the callback to capture state, you need to wrap an `async move {}` block 
+    /// in a regular function. Basically, you need to pass in a regular function that returns
+    /// a future, an `async ||` closure won't work. It's annoying but its what
+    /// the async overlords want. It will look like this:
+    /// 
+    /// `store.on_expire(move |expired| { /* capture data here */ async move { /* do something  with captured data*/ } });`
+    pub fn on_expire(mut self, fut: impl Into<AsyncCallback<Vec<(Uuid, Entry<V>)>>>) -> Self {
+        self.on_expire = Some(fut.into());
+        self
+    }
+
+    /// Build the LiveStore from this builder.
+    /// 
+    /// This will also start the on_expire interval if configured.
+    pub fn done(self) -> Arc<LiveStore<V>> {
+        // Construct the map
+        let store = Arc::new(
+            LiveStore {
+                map: self.options.shard_amt.map(|amt| DashMap::with_shard_amount(amt)).unwrap_or_default(),
+                options: self.options,
+                on_expire: self.on_expire,
+            }
+        );
+
+        // Dispatch auto-expire task.
+        // This tasks downgrades the Store's Arc to a `Weak`, so you'll
+        // be able to drop the store and this task will end. 
+        //
+        // This task will respond to `ctrl_c` as well.
+        if let Some(check_dur) = store.options.expire_check_freq {
+            let store = Arc::downgrade(&store);
+
+            tokio::spawn(async move {
+                // timer that resets when it completes.
+                let mut interval = tokio::time::interval(check_dur);
+                // ignore first tick (completes instantly)
+                interval.tick().await;
+    
+                'outer: loop {
+                    // Select between ctrl_c and the interval, whichever completes first.
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            let Some(store) = store.upgrade() else { break 'outer; };
+                            if let Some(on_expire) = &store.on_expire {
+                                match store.options.expire_mode {
+                                    ExpireMode::Timeout(dur) => {
+                                        // Timeout + OnExpire
+                                        let min = Instant::now() - dur;
+                                        let expired = store.collect_expired_by_timeout(min);
+                                        if !expired.is_empty() {
+                                            on_expire.call(expired).await;
+                                        }
+                                    }
+                                }
+                            } else {
+                                match store.options.expire_mode {
+                                    ExpireMode::Timeout(dur) => {
+                                        // Timeout + NO OnExpire cb
+                                        let min = Instant::now() - dur;
+                                        store.expire_by_timeout(min);
+                                    }
+                                }
+                            }
+                        },
+                        _ = tokio::signal::ctrl_c() => {
+                            break 'outer;
+                        }
+                    }
+                }
+            });
+        }
+
+        store
     }
 }
 
@@ -747,6 +1000,9 @@ impl<V: LiveValue> Deref for EntryGuard<V> {
 }
 
 impl<V: LiveValue> Watch<V> {
+    /// Await the next update from the receiver. 
+    /// If the corresponding sender has closed, this will
+    /// return `None`. 
     pub async fn next(&mut self) -> Option<Update<V>> {
         loop {
             match self.rx.recv().await {
@@ -756,7 +1012,7 @@ impl<V: LiveValue> Watch<V> {
                         RecvError::Closed => return None,
                         RecvError::Lagged(amt) => {
                             eprintln!(
-                                "A receiver lagged by '{amt}' messages. Consider increasing the channel capacity for '{}'", 
+                                "A receiver lagged by '{amt}' messages. Consider increasing the channel capacity for live type '{}'", 
                                 type_name::<V>()
                             );
                             continue
@@ -765,31 +1021,6 @@ impl<V: LiveValue> Watch<V> {
                 }
             }
         }
-    }
-
-    /// Watch for changes to the subscribed value.
-    /// The provided closure will run whenever the value is updated.
-    ///
-    /// To keep watching for changes, use `Control::Break` to close the 
-    /// receiver.
-    pub fn on_update<F, Fut>(mut self, mut f: F) 
-    where
-        F: FnMut(Update<V>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output=Control> + Send + Sync + 'static
-    {
-        tokio::spawn(async move {
-            loop {
-                match self.rx.recv().await {
-                    Ok(update) => {
-                        if let Control::Break = (f)(update).await {
-                            return;
-                        }
-                    },
-                    Err(RecvError::Closed) => return,
-                    _ => {}
-                }
-            }
-        });
     }
 }
 
@@ -803,13 +1034,39 @@ fn panic_uninit_value_type<T: Any>() -> ! {
     ", type_name::<T>())
 }
 
+pub struct AsyncCallback<In, Out=()>(Arc<dyn Fn(In) -> Pin<Box<dyn Future<Output=Out> + Send + Sync>> + Send + Sync + 'static>);
+
+impl<In, Out> Clone for AsyncCallback<In, Out> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<In, Out> AsyncCallback<In, Out> {
+    pub async fn call(&self, input: In) -> Out {
+        (self.0)(input).await
+    }
+}
+
+impl<In, Out, F, Fut> From<F> for AsyncCallback<In, Out> 
+where
+    F: Fn(In) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output=Out> + Send + Sync + 'static,
+{
+    fn from(value: F) -> Self {
+        Self(Arc::new(move |input| Box::pin(value(input))))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{sync::{Arc, Mutex}, time::Duration};
 
-    use crate::{Control, LiveStore, LiveValue, StoreOptions, Update};
+    use uuid::Uuid;
 
-    #[derive(Clone)]
+    use crate::{Entry, ExpireMode, LiveStore, LiveValue, StoreOptions, Update};
+
+    #[derive(Clone, PartialEq, Eq, Debug)]
     struct Foo {
         bar: u32,
         baz: u64,
@@ -834,27 +1091,89 @@ mod tests {
         }
     }
 
-    #[test]
-    fn subscribe() {
-        let store = LiveStore::<Foo>::new(StoreOptions::default());
+    #[tokio::test]
+    async fn mutate() {
+        let store = LiveStore::<Foo>::default();
         let key = store.init(Foo { bar: 0, baz: 1 });
-        let sub = store.watch(&key).unwrap();
+        store.mutate(&key, FooMutation::SetBar(6)).await.unwrap().unwrap();
+        store.mutate(&key, FooMutation::SetBaz(9)).await.unwrap().unwrap();
+        let val = store.remove(&key).await.unwrap();
+        assert_eq!(val.bar, 6);
+        assert_eq!(val.baz, 9);
+    }
 
-        let bar_lock = Arc::new(Mutex::new(0));
-        let baz_lock = Arc::new(Mutex::new(0));
+    #[tokio::test]
+    async fn subscribe() {
+        let store = LiveStore::<Foo>::default();
+        let key = store.init(Foo { bar: 0, baz: 1 });
+        let mut watch = store.watch(&key).unwrap();
 
-        let bar_lock2 = bar_lock.clone();
-        let baz_lock2 = baz_lock.clone();
-
-        sub.on_update(async move |update| {
-            if let Update::Mutate { mutn, .. } = update {
-                match mutn {
-                    FooMutation::SetBar(bar) => *bar_lock2.lock().unwrap() = bar,
-                    FooMutation::SetBaz(baz) => *baz_lock2.lock().unwrap() = baz,
+        let lock1 = Arc::new(Mutex::new(Foo { bar: 0, baz: 0 }));
+        let lock2 = lock1.clone();
+        
+        let rx_task = tokio::spawn(async move {
+            while let Some(update) = watch.next().await {
+                if let Update::Mutate { mutn, .. } = update {
+                    match mutn {
+                        FooMutation::SetBar(bar) => lock2.lock().unwrap().bar = bar,
+                        FooMutation::SetBaz(baz) => lock2.lock().unwrap().baz = baz,
+                    }
                 }
             }
-
-            Control::Continue
         });
+
+        store.mutate(&key, FooMutation::SetBar(6)).await.unwrap().unwrap();
+        store.mutate(&key, FooMutation::SetBaz(9)).await.unwrap().unwrap();
+        let val = store.remove(&key).await.unwrap();
+        rx_task.await.unwrap();
+
+        assert_eq!(val.bar, 6);
+        assert_eq!(val.baz, 9);
+        assert_eq!(lock1.lock().unwrap().bar, 6);
+        assert_eq!(lock1.lock().unwrap().baz, 9);
+        assert!(store.fetch(&key).is_none());
+    }
+
+    #[tokio::test]
+    async fn on_expire() {
+        let expired = Arc::new(Mutex::new(Vec::new()));
+        let expired2 = expired.clone();
+
+        let store = LiveStore::<Foo>::new()
+            .with_options(
+                StoreOptions {
+                    expire_check_freq: Some(Duration::from_secs(1)),
+                    expire_mode: ExpireMode::Timeout(Duration::from_millis(1)),
+                    ..Default::default()
+                }
+            )
+            .on_expire(move |buf: Vec<(Uuid, Entry<Foo>)>| {
+                let expired = expired2.clone();
+                async move {
+                    expired.lock().unwrap().extend(buf.iter().map(|(_, item)| item.value.as_ref().clone()));
+                }
+            }).done();
+
+        let f1 = Foo { bar: 0, baz: 1 };
+        let f2 = Foo { bar: 1, baz: 2 };
+        let f3 = Foo { bar: 2, baz: 3 };
+
+        let k1 = store.init(f1.clone());
+        let k2 = store.init(f2.clone());
+        let k3 = store.init(f3.clone());
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        assert!(store.fetch(&k1).is_none());
+        assert!(store.fetch(&k2).is_none());
+        assert!(store.fetch(&k3).is_none());
+
+        let guard = expired.lock().unwrap();
+
+        for foo in [f1, f2, f3] {
+            if !guard.contains(&foo) {
+                panic!("{:?}, {:?}", foo, guard)
+            }
+        }
     }
 }

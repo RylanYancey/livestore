@@ -1,216 +1,179 @@
+# livestore
 
-# Livestore
-A statically typed ultra lightweight alternative to Redis. 
+A statically typed ultra lightweight alternative to Redis.
 
-Livestore is a Key/Value store intended for use in real-time websocket servers. All data is kept in-memory and unserialized, and is discarded when the application is stopped. 
+A LiveStore is a concurrent hashmap for use in real-time websocket servers.
+Keys are always UUID-V4, and the values can be anything that implements `LiveValue`.
 
-## Features
-- Insert/Remove entries (keys are UUID-V4)
-- Powered by `DashMap` internally
-- Prevent race conditions with asyncronous per-entry mutation locks
-- Subscribe to mutations with async broadcast channels
-- Dispatch mutations and non-mutating messages
-- Set auto-expire timeouts
+All data is kept in-memory in its native rust layout. This eliminates the overhead of
+deserializing/serializing data on every access, but any data in the store will
+be dropped when the store is dropped. We do not yet support any in-disk caching or saving/loading
+of values.
 
-## Todos
+### Features
+- Insert/Remove/Fetch
+- Powered by Google ABSL Hash Table (DashMap)
+- Per-Entry mutation locking (prevents race conditions)
+- Subscribe/Listen to value updates asyncronously (via Tokio broadcast)
+- Auto-expire on timeout
+
+### Todos
 - Rollback/Version tracking
-- Serializing and Deserializing Stores
+- Serializing and Deserializing Stores, save/load
+- Lower per-entry memory usage
 
-## Should you use Livestore?
-Probably not. This is maintained by a 20-something year old college dropout in his free time, not by a conglomerate or corporation with millions of dollars. You will probably get better performance and way more features using Redis. That being said, if you hate the Redis API as much as I do, it just might be worth it. 
+### Should you use LiveStore?
+Probably not. This is maintained by a college dropout in his 20s, not a corporation or conglomerate with millions
+of dollars. You will probably get better performance and features by just using Redis. But, if you hate dynamic
+typing as much as I do, you might find some value in it.
 
-## Concepts
-**Map-level Locks**\
-Internally each store is a `DashMap`, a rust implementation of google's ABSL concurrent hashmap. This breaks down the map into a series of 8 (configurable) *shards*, each with its own lock. The priority when operating on entries in the map is to hold the Map-level lock for *as short a period as possible*, to reduce the probability of contention. We optimize this by cloning entry values out instead of returning a reference to entries like you might expect. 
+### Concepts
+**Map-level Locks (Sync)**\
+Internally each store is a `DashMap`, which is a HashMap broken up into "shards", or parts. Each shard has its own
+RwLock that needs to be acquired when reading or writing to its entries. To minimize the probability of contention,
+LiveStore tries to hold on to this lock for as short a period as possible. Thats' why none of the functions return a
+reference to entries, its always a clone.
 
-**Entry-level Locks**\
-A common operation is to read, compute changes, then assign a new value. But if it is possible for another thread to mutate the value while you are computing changes, then a race condition occurs. If not properly handled, this can lead to invalid states and/or an unexpected crash. We can't solve this problem by holding onto the Map-level lock because that creates a very high probability of contention, so each entry has a `tokio::sync::Mutex<()>` that prevents mutation while it is held. Note that this does not prevent the value from being read, only mutated or acquired. When a process calls `LiveStore::acquire().await`, the process may await until the lock is free. The returned `EntryGuard` guarantees that the value will not change until the guard is dropped. 
+**Entry-level Locks (Async)**\
+A common operation is to read, compute changes, then assign a new value. But if another process mutates the value
+while another is computing changes, a race conditions occurs. This can lead to invalid states and unexpected crashes.
+To solve this, we could hold onto the map lock for the duration we are computing changes, but that would make the probability
+of contention too high, especially if the lock is held through an await. So instead there is a per-entry Mutex that
+can be acquired to prevent the state from being invalidated for the duration it is held. When a function with `.acquire`
+is called, an [`EntryGuard`] is returned, preventing any mutations or acquisitions until it is dropped.
 
 **Live Value**\
-A type that implements `LiveValue` and exists in a `LiveStore`. 
+A type that implements `LiveValue` and exists in a `LiveStore`.
 
 **Mutation**\
 An event that can be dispatched to mutate a value and inform any subscribed tasks of the change.
 
 **Message**\
-A non-mutating event that can be dispatched just like a Mutation and is sent to all subscribed tasks, but does not alter value state. 
+An event that can be dispatched just like a mutation and is sent to subscribed tasks, but does not alter value state.
 
-## Usage Examples
-**Implement LiveValue for your type**
-```rs
-use livestore::{LiveValue, Entry};
+### Usage
+The first step is to implement `LiveValue` for your type. The associated types (Message, Mutation, MutError) are optional
+and can be set to `()` if you don't use them.
 
-#[derive(Clone)] // LiveValues must be Clone
-pub struct Foo {
-    pub bar: u32,
-    pub baz: u64,
+Then, create a `LiveStore` with the builder via `LiveStore::new()` or use the provided defaults with `LiveStore::default()`.
+
+If you want a type-erased container, this crate also provides the `Storages` type, a convenience for erasing the
+value type and accessing with `Any::downcast()`.
+```rust
+use std::time::Duration;
+use livestore::{LiveStore, LiveValue, Entry, Update, StoreOptions, ExpireMode, Uuid};
+
+/// **Your Value Type**
+#[derive(Clone)]
+struct Foo {
+    bar: u32,
+    baz: u64
 }
 
 #[derive(Clone)]
-pub enum FooMessage {
-    SendBar,
+enum FooMessage {
+    PrintBar
 }
 
 #[derive(Clone)]
-pub enum FooMutation {
+enum FooMutation {
     SetBar(u32),
-    SetBaz(u64),
+    SetBaz(u64)
 }
 
-pub enum FooError {
-    BarWas42,
+#[derive(Clone)]
+enum FooError {
+    BarWas42
 }
 
+// **Implement LiveValue for your Type**
 impl LiveValue for Foo {
-    /// A message to subscribed async tasks
-    /// that does not mutate the value.
     type Message = FooMessage;
-
-    /// A message that executes a mutation on the contained value 
-    /// before being broadcast to any subscribed async tasks.
     type Mutation = FooMutation;
-
-    /// An Error that may occur while applying a mutation.
     type MutError = FooError;
 
-    /// Apply a mutation to the entry, returning an error if the operation fails.
-    /// 
-    /// If the mutation is a success, an `Update::Mutate` is broadcast to any
-    /// subscribed async tasks.
     fn mutate(entry: &Entry<Self>, mutation: &Self::Mutation) -> Result<Self, Self::MutError> {
         match mutation {
             FooMutation::SetBar(bar) => {
-                if bar == 42 {
+                if *bar == 42 {
                     Err(FooError::BarWas42)
                 } else {
-                    Ok(Foo { 
-                        bar, 
-                        baz: entry.baz 
+                    Ok(Foo {
+                        bar: *bar,
+                        baz: entry.baz
                     })
                 }
             },
             FooMutation::SetBaz(baz) => {
-                Ok(Foo { 
-                    bar: entry.bar, 
-                    baz 
+                Ok(Foo {
+                    bar: entry.bar,
+                    baz: *baz
                 })
             }
         }
     }
 }
-```
-**Initialize a LiveStore for your Type**
-```rs
-use std::time::Duration;
-use livestore::{LiveStore, StoreOptions};
 
-let foo_store = LiveStore::new(
-    StoreOptions {
-        /// The maximum number of mutations that
-        /// can be stored in the value's broadcast queue.
-        channel_cap: 4,
-
-        /// The number of shards a store is split up into.
-        /// This is passed to the inner `DashMap`. The value
-        /// must be a power of 2 and non-zero. For low-access
-        /// maps, you can get away with a lower shard amt, but
-        /// high-access maps should have a higher shard amt.
-        shard_amt: None,
-
-        /// The frequency that the auto-expire check is ran.
-        /// This requires iteration of _every_ value in the
-        /// store, so it shouldn't be ran too often. 
-        /// 
-        /// If this value is `None`, the check will never run.
-        expire_check_freq: Some(Duration::from_minutes(15)),
-
-        /// The maximum amount of a time a value can live without
-        /// being mutated before it will be auto-expired. 
-        expire_timeout: Some(Duration::from_minutes(10)),
-    }
-);
-
-let key = store.init(Foo { bar: 0, baz: 1 });
-
-if let Some(entry) = store.fetch(&key) {
-    println!("Bar: {}", entry.bar)
-}
-```
-(Optional) **Configure an on-expire callback**
-```rs
-async fn on_foo_expire(expired: Vec<(Uuid, Entry<V>)>) {
-    for (_, foo) in expired {
-        println!("Baz '{}' expired.", foo.baz)
-    }
-}
-
-foo_store.on_expire(on_foo_expire);
-```
-(Optional) **Add Stores to `Storages`**
-```rs
-use livestore::Storages;
-
-// Storages is a convnience for erasing the type from LiveStores
-let storages = Storages::new()
-    .add_store(foo_store)
-    .done();
-
-// Access by downcasting from `Arc<dyn Any>`
-let store = storages.as_store::<Foo>();
-```
-**Initialize Live Values in the Store**
-```rs
-let foo = Foo { bar: 1, baz: 0 };
-
-// Generate a UUID and insert, returning the UUID.
-let key = foo_store.init(foo.clone());
-
-// Create a new entry without overwriting. 
-if let Some(_) = foo_store.create(&key, foo.clone()) {
-    println!("Did not create because the entry already exists.")
-}
-
-let new = Foo { bar: 2, baz: 9 };
-
-// Assign a new value to the key, without creating a new value.
-if let None = foo_store.assign(&key, new.clone()).await {
-    println!("Did not Assign because the entry doesn't exist.");
-}
-
-// Insert combines the behavior of Assign and Create. It
-// inserts if the key doesn't exist and overwrites if it does.
-if let Some(old) = foo_store.insert(&key, new.clone()).await {
-    println!("Bar '{}' was overwritten.", old.bar);
-}
-
-if let Some(entry) = foo_store.remove(&key).await {
-    println!("Baz '{}' was removed.", entry.baz);
-}
-```
-**Dispatch and Respond to Mutations**
-```rs
-let foo = Foo { bar: 3, baz: 1 };
-let key = foo_store.init(foo.clone());
-
-if let Some(watch) = foo_store.watch(&key) {
-    watch.on_update(|update| {
-        match update {
-            Update::Overwrite { new, old, .. } => println!("Bar '{}' is now '{}'", old.bar, new.bar),
-            Update::Remove { val, msg, .. } => println!("Baz '{}' was removed.", val.baz),
-            Update::Mutate { new, old, .. } => println!("Bar '{}' is now '{}'", old.bar, new.bar),
-            Update::Message { val, msg } => {
-                match msg {
-                    FooMessage::SendBar => println!("Bar: {}", val.bar),
+#[tokio::main]
+async fn main() {
+    let store = LiveStore::<Foo>::new()
+        // Configure the store to auto-remove entries
+        // that haven't been mutated in 10 minutes, checked every 15 minutes.
+        .with_options(
+            StoreOptions {
+                expire_check_freq: Some(Duration::from_secs(900)),
+                expire_mode: ExpireMode::Timeout(Duration::from_secs(600)),
+                ..Default::default()
+            }
+        )
+        // **Set an expiration callback**
+        .on_expire(move |expired: Vec<(Uuid, Entry<Foo>)>| {
+            async move {
+                for (_, item) in expired {
+                    println!("Baz '{}' expired.", item.baz);
                 }
+            }
+        })
+        .done();
+
+    // Initialize values
+    let k1 = store.init(Foo { bar: 0, baz: 1 });
+    let k2 = store.init(Foo { bar: 1, baz: 0 });
+
+    // Begin watching for changes
+    let mut sub = store.watch(&k1).unwrap();
+    tokio::spawn(async move {
+        while let Some(update) = sub.next().await {
+            match update {
+                Update::Mutate { mutn, .. } => {
+                    match mutn {
+                        FooMutation::SetBar(bar) => println!("Set bar to '{bar}'."),
+                        FooMutation::SetBaz(baz) => println!("Set baz to '{baz}'."),
+                    }
+                },
+                Update::Message { msg, val } => {
+                    match msg {
+                        FooMessage::PrintBar => println!("Bar: {}", val.bar),
+                    }
+                },
+                _ => {}
             }
         }
     });
+
+    // Dispatch mutations and broadcast messages.
+    store.mutate(&k1, FooMutation::SetBar(6)).await;
+    store.mutate(&k1, FooMutation::SetBaz(9)).await;
+    store.broadcast(&k1, FooMessage::PrintBar);
+
+    // Acquire mutation locks.
+    let mut entry2 = store.acquire(&k2).await.unwrap();
+    entry2.mutate(FooMutation::SetBar(7));
+    entry2.mutate(FooMutation::SetBaz(10));
+    entry2.broadcast(FooMessage::PrintBar);
+
+    // Remove entries from the store.
+    entry2.delete();
+    store.remove(&k1).await.unwrap();
 }
-
-// Dispatch a mutation to foo that will trigger an `Update::Mutate` on foo. 
-foo_store.mutate(&key, FooMutation::SetBar(54));
-```
-**Acquire Entry Mutation Locks**
-```rs
-
 ```
