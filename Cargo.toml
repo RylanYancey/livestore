@@ -5,7 +5,7 @@ edition = "2024"
 authors = ["Rylan W. Yancey"]
 description = "Concurrent key-value store with pub/sub capability for Websocket servers."
 repository = "https://github.com/RylanYancey/livestore"
-license = "MIT OR Apache 2.0"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 boomphf = "0.6.0"
